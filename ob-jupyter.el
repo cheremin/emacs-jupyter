@@ -47,6 +47,17 @@
 (declare-function org-babel-expand-body:generic "ob-core" (body params &optional var-lines))
 (declare-function org-export-derived-backend-p "ox" (backend &rest backends))
 
+(declare-function jupyter-server "jupyter-server")
+(declare-function jupyter-find-server "jupyter-server")
+(declare-function jupyter-run-server-repl "jupyter-server")
+(declare-function jupyter-connect-server-repl "jupyter-server")
+(declare-function jupyter-server-kernelspecs "jupyter-server")
+(declare-function jupyter-api-get-kernel "jupyter-rest-api")
+
+(declare-function jupyter-tramp-url-from-file-name "jupyter-tramp")
+(declare-function jupyter-tramp-server-from-file-name "jupyter-tramp")
+(declare-function jupyter-tramp-file-name-p "jupyter-tramp")
+
 (defvaralias 'org-babel-jupyter-resource-directory
   'jupyter-org-resource-directory)
 
@@ -209,6 +220,28 @@ variables in PARAMS."
            (jupyter-runtime-directory (concat remote runtime-directory)))
       (jupyter-run-repl kernel nil nil 'jupyter-org-client))))
 
+(defun org-babel-jupyter--server-repl (session kernel)
+  (require 'jupyter-server)
+  (let ((url (jupyter-tramp-url-from-file-name session))
+        (name-or-id (file-local-name session)))
+    (unless name-or-id
+      (error "No remote server session name"))
+    (let* ((server (or (jupyter-tramp-server-from-file-name session)
+                       (jupyter-server :url url)))
+           (specs (jupyter-server-kernelspecs server))
+           (kmodel (ignore-errors (jupyter-api-get-kernel server name-or-id))))
+      (unless (jupyter-guess-kernelspec kernel specs)
+        (error "No kernelspec matching \"%s\" exists at %s" kernel url))
+      (if kmodel
+          ;; Connecting to an existing kernel
+          (cl-destructuring-bind (&key name id &allow-other-keys) kmodel
+            (unless (string-match-p kernel name)
+              (error "\":kernel %s\" doesn't match \"%s\"" kernel name))
+            (jupyter-connect-server-repl server id nil nil 'jupyter-org-client))
+        ;; If the file local name of SESSION doesn't match an existing kernel,
+        ;; we are starting a new one.
+        (jupyter-run-server-repl server kernel nil nil 'jupyter-org-client)))))
+
 (defun org-babel-jupyter-initiate-session-by-key (session params)
   "Return the Jupyter REPL buffer for SESSION.
 If SESSION does not have a client already, one is created based
@@ -235,7 +268,11 @@ the host."
              ((string-suffix-p ".json" session)
               (jupyter-connect-repl session nil nil 'jupyter-org-client))
              (t
-              (org-babel-jupyter--run-repl session kernel))))
+              (funcall (if (and (file-remote-p session)
+                                (jupyter-tramp-file-name-p session))
+                           #'org-babel-jupyter--server-repl
+                         #'org-babel-jupyter--run-repl)
+                       session kernel))))
       (jupyter-set client 'jupyter-include-other-output nil)
       (jupyter-with-repl-buffer client
         (let ((name (buffer-name)))
