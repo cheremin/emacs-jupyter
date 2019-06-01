@@ -912,6 +912,10 @@ otherwise nil."
   "Return non-nil if MODEL corresponds to Base64 encoded content."
   (equal (plist-get model :format) "base64"))
 
+(defun jupyter-api-notebook-p (model)
+  "Return non-nil if MODEL corresponds to Jupyter notebook JSON."
+  (equal (plist-get model :format) "json"))
+
 (defun jupyter-api-insert-model-content (model &optional replace beg end)
   "Insert the content of MODEL into the current buffer.
 If REPLACE is non-nil, replace the contents of the current buffer
