@@ -40,6 +40,7 @@
 (require 'jupyter-base)
 (require 'websocket)
 (require 'url)
+(require 'url-http)
 
 (declare-function jupyter-decode-time "jupyter-messages")
 
@@ -233,6 +234,13 @@ request data."
 ;; and
 ;; http://www.tornadoweb.org/en/stable/guide/security.html#cross-site-request-forgery-protection
 
+(defun jupyter-api-request-xsrf-cookie (client)
+  "Send a request using CLIENT to retrieve the _xsrf cookie."
+  (let ((url-request-method "GET")
+        url-request-extra-headers
+        url-request-data)
+    (jupyter-api--url-request (concat (oref client url) "/login"))))
+
 (defun jupyter-api-xsrf-header-from-cookies (url)
   "Return an alist containing an X-XSRFTOKEN header or nil.
 Searches the cookies of URL for an _xsrf token, if found, sets
@@ -273,11 +281,15 @@ see RFC 6265."
 
 ;;;; Authentication methods
 
+(defvar jupyter-api--authentication-in-progress-p nil)
+
 (defun jupyter-api-server-accessible-p (client)
   "Return non-nil if CLIENT can access the Jupyter server."
-  ;; Use an authenticated endpoint so that we know for sure we can access the
-  ;; server.
-  (and (ignore-errors (jupyter-api-get-kernelspec client)) t))
+  (ignore-errors
+    (prog1 t
+      (let ((jupyter-api--authentication-in-progress-p t)
+            url-request-data url-request-extra-headers)
+        (jupyter-api-get-kernelspec client)))))
 
 (define-error 'jupyter-api-login-failed "Login attempt failed")
 
@@ -286,26 +298,21 @@ see RFC 6265."
     (let ((err (plist-get status :error)))
       (unless
           (or (not err)
-              ;; Handle unauthorized requests that set the XSRF cookie
-              (and (not (assoc "X-XSRFTOKEN" url-request-extra-headers))
-                   (= (nth 2 err) 403)
-                   (jupyter-api-xsrf-header-from-cookies url-current-object))
-              ;; Handle HTTP 1.0. When given a POST request, 302
-              ;; redirection doesn't change the method to GET
-              ;; dynamically. On the Jupyter notebook, the redirected
-              ;; page expects a GET and will return 405 (invalid
-              ;; method).
+              ;; Handle HTTP 1.0. When given a POST request, 302 redirection
+              ;; doesn't change the method to GET dynamically. On the Jupyter
+              ;; notebook, the redirected page expects a GET and will return
+              ;; 405 (invalid method).
               (and (plist-get status :redirect)
                    (= url-http-response-status 302)
                    (= (nth 2 err) 405)))
         (signal 'jupyter-api-login-failed err)))))
 
-(defun jupyter-api-login (client)
+(defun jupyter-api--login (client)
   "Attempt to login to the server using CLIENT.
-Login is attempted by sending a POST request to CLIENT's login
-endpoint using `url-retrieve', `url-request-data' and
-`url-request-extra-headers' should be let bound with the login
-data.
+Login is attempted by sending a GET request to CLIENT's login
+endpoint using `url-retrieve'. To change the login information,
+set `url-request-method', `url-request-data', and
+`url-request-extra-headers'.
 
 On success, write the URL cookies to file so that they can be
 used by other Emacs processes and return non-nil.
@@ -316,8 +323,7 @@ raise an error.
 If the login attempt failed, raise a `jupyter-api-login-failed'
 error with the data being the error received by `url-retrieve'."
   (declare (indent 1))
-  (let* ((url-request-method "POST")
-         (url (oref client url))
+  (let* ((url (oref client url))
          (status nil)
          (done nil)
          (cb (lambda (s &rest _) (setq status s done t)))
@@ -337,6 +343,36 @@ error with the data being the error received by `url-retrieve'."
     (url-cookie-write-file)
     t))
 
+(defun jupyter-api-login (client)
+  "Attempt to login to the server using CLIENT.
+Login is attempted by sending a GET request to CLIENT's login
+endpoint using `url-retrieve'. To change the login information,
+set `url-request-method', `url-request-data', and
+`url-request-extra-headers'."
+  (url-do-setup)
+  (jupyter-api-request-xsrf-cookie client)
+  (let ((url-request-extra-headers
+         (append url-request-extra-headers
+                 (jupyter-api-xsrf-header-from-cookies (oref client url))
+                 (jupyter-api-auth-headers client)))
+        (orig (symbol-function #'url-http-handle-authentication)))
+    ;; Workaround to suppress the authentication handling of `url-retrieve'.
+    ;; Jupyter notebook return a 401 response without a www-authenticate header
+    ;; and `url-http-handle-authentication' handles this by defaulting to
+    ;; "basic" authentication which we don't want happening.
+    (cl-letf (((symbol-function #'url-http-handle-authentication)
+               (lambda (proxy &rest args)
+                 ;; If there is an authenticate header, let the default
+                 ;; `url-http-handle-authentication' handle it.
+                 (if (mail-fetch-field
+                      (if proxy "proxy-authenticate" "www-authenticate")
+                      nil nil t)
+                     (apply orig proxy args)
+                   ;; Otherwise assume we are authenticated to suppress the
+                   ;; "basic" authentication handling.
+                   t))))
+      (jupyter-api--login client))))
+
 (defun jupyter-api-authenticate (client authenticator &optional max-tries)
   "Call AUTHENTICATOR then check if CLIENT can access the REST server.
 Repeat up to MAX-TRIES before signaling an error if CLIENT cannot
@@ -350,7 +386,8 @@ MAX-TRIES defaults to `jupyter-api-max-authentication-attempts'."
   (or (numberp max-tries)
       (setq max-tries jupyter-api-max-authentication-attempts))
   (let ((try -1)
-        (auth (oref client auth)))
+        (auth (oref client auth))
+        (jupyter-api--authentication-in-progress-p t))
     (while (and (not (progn
                        (funcall authenticator client (cl-incf try))
                        (jupyter-api-server-accessible-p client)))
@@ -367,9 +404,15 @@ Authorization header.
 Raise an error on failure."
   (jupyter-api-authenticate client
     (lambda (client _)
-      (oset client auth
-            (list (cons "Authorization"
-                        (concat "token " (read-string "Token: "))))))))
+      (let ((token (read-string (format "Token [%s]: " (oref client url)))))
+        (oset client auth
+              (list (cons "Authorization" (concat "token " token)))))
+      (let ((url-request-method "GET"))
+        (condition-case err
+            (jupyter-api-login client)
+          (error
+           (when (eq (nth 2 err) 'connection-failed)
+             (signal (car err) (cdr err)))))))))
 
 (defun jupyter-api-password-authenticator (client &optional passwd)
   "Authenticate CLIENT by asking for a password.
@@ -382,35 +425,27 @@ Raise an error on failure."
   (or (functionp passwd) (setq passwd (lambda (_) (read-passwd "Password: "))))
   (jupyter-api-authenticate client
     (lambda (client try)
-      (let ((url-request-extra-headers
-             (append (list (cons "Content-Type" "application/x-www-form-urlencoded"))
-                     (jupyter-api-xsrf-header-from-cookies (oref client url))
-                     url-request-extra-headers))
-            (url-request-data nil))
-        (setq url-request-data (concat "password=" (funcall passwd try)))
+      (let* ((url-request-method "POST")
+             (url-request-extra-headers
+              (append (list (cons "Content-Type" "application/x-www-form-urlencoded"))
+                      url-request-extra-headers))
+             (url-request-data (concat "password=" (url-hexify-string
+                                                    (funcall passwd try)))))
         (condition-case err
             (jupyter-api-login client)
           (error
            (when (eq (nth 2 err) 'connection-failed)
              (signal (car err) (cdr err)))))))))
 
-(defvar jupyter-api--authentication-in-progress-p nil)
-
 (defun jupyter-api--ensure-authenticated (client)
   (cl-check-type client jupyter-rest-client)
   (unless jupyter-api--authentication-in-progress-p
     (let ((jupyter-api--authentication-in-progress-p t))
-      (url-do-setup)
       (with-slots (auth url) client
         (unless (or (listp auth)
                     (not (memq auth '(ask token password))))
           (when (eq auth 'ask)
-            ;; Check to see if the server is accessible first by trying to
-            ;; access the login page and checking if we can make an
-            ;; authenticated request afterwards.
-            (let ((jupyter-api-max-authentication-attempts 1))
-              (jupyter-api-password-authenticator client
-                (lambda (_) "")))
+            (jupyter-api-request-xsrf-cookie client)
             (if (jupyter-api-server-accessible-p client)
                 (oset client auth t)
               (when noninteractive
@@ -423,8 +458,7 @@ Raise an error on failure."
                 (oset client auth 'password)))))
           (pcase auth
             ('token
-             (jupyter-api-token-authenticator client)
-             (oset client auth t))
+             (jupyter-api-token-authenticator client))
             ('password
              (message "Attempting login to %s" (oref client url))
              (unless noninteractive (sit-for 2))

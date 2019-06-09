@@ -63,6 +63,21 @@
                  (should (equal (plist-get plist :on-open) 'identity)))))
       (jupyter-api-request client "WS" "kernels" :on-open 'identity))))
 
+(ert-deftest jupyter-api-get-kernel-ws ()
+  :tags '(rest)
+  (let* ((host (format "localhost:%s" (jupyter-test-ensure-notebook-server)))
+         (client (jupyter-rest-client :url (format "http://%s" host))))
+    (cl-destructuring-bind (&key id &allow-other-keys)
+        (jupyter-api-start-kernel client)
+      (unwind-protect
+          (let ((ws (jupyter-api-get-kernel-ws client id)))
+            (unwind-protect
+                (progn
+                  (should (websocket-openp ws))
+                  (should (equal (websocket-client-data ws) id)))
+              (websocket-close ws)))
+        (jupyter-api-shutdown-kernel client id)))))
+
 (ert-deftest jupyter-api-copy-cookies-for-websocket ()
   :tags '(rest)
   (let* (url-cookie-storage
@@ -82,7 +97,9 @@
        ;; purposes
        do (should (member cookie old-cookies))))))
 
-(ert-deftest jupyter-api-password-authenticator ()
+(defvar url-cookie-storage)
+
+(ert-deftest jupyter-api-login ()
   :tags '(rest)
   (let (cookies-copied-before-write
         cookies-written
@@ -93,42 +110,85 @@
               ((symbol-function #'jupyter-api-copy-cookies-for-websocket)
                (lambda (&rest _)
                  (setq cookies-copied-before-write t)))
-              ((symbol-function #'jupyter-api-server-accessible-p)
-               (lambda (&rest _) t))
+              ((symbol-function #'jupyter-api-request-xsrf-cookie) #'ignore)
               ((symbol-function #'url-cookie-write-file)
                (lambda (&rest _)
                  (should cookies-copied-before-write)
                  (setq cookies-written t))))
       (url-cookie-store "_xsrf" "1" nil "localhost" "/")
       (jupyter-test-rest-api
-       (let ((url-request-extra-headers
-              (jupyter-api-xsrf-header-from-cookies
-               (format "http://%s" host))))
-         (jupyter-api-password-authenticator
-             (jupyter-rest-client :url (format "http://%s" host))))
-       (should (equal url-request-method "POST"))
+       (jupyter-api-login
+           (jupyter-rest-client
+            :url (format "http://%s" host)
+            :auth (list (cons "Authorization" "foo"))))
        (should (equal url (format "http://%s/login" host)))
        (should (equal (cdr (assoc "X-XSRFTOKEN" url-request-extra-headers)) "1"))
-       (should (equal (cdr (assoc "Content-Type" url-request-extra-headers))
-                      "application/x-www-form-urlencoded"))
-       (should (equal url-request-data "password=foo"))))
+       (should (equal (cdr (assoc "Authorization" url-request-extra-headers)) "foo"))))
+    (should cookies-copied-before-write)
     (should cookies-written)))
 
-(ert-deftest jupyter-api-get-kernel-ws ()
+(ert-deftest jupyter-api-server-accessible-p ()
   :tags '(rest)
   (let* ((host (format "localhost:%s" (jupyter-test-ensure-notebook-server)))
-         (client (jupyter-rest-client :url (format "http://%s" host))))
-    (cl-destructuring-bind (&key id &allow-other-keys)
-        (jupyter-api-start-kernel client)
-      (unwind-protect
-          (let ((ws (jupyter-api-get-kernel-ws client id)))
-            (unwind-protect
-                (progn
-                  (should (websocket-openp ws))
-                  (should (equal (websocket-client-data ws) id)))
-              (websocket-close ws)))
-        (jupyter-api-shutdown-kernel client id)))))
+         (client (jupyter-rest-client :url (format "http://%s" host)))
+         (url-cookie-storage nil))
+    (should (jupyter-api-server-accessible-p client))))
 
+(ert-deftest jupyter-api-request-xsrf-cookie ()
+  :tags '(rest)
+  (let* ((host (format "localhost:%s" (jupyter-test-ensure-notebook-server)))
+         (client (jupyter-rest-client :url (format "http://%s" host)))
+         (url (oref client url))
+         (url-cookie-storage nil))
+    (should-not (jupyter-api-xsrf-header-from-cookies url))
+    (jupyter-api-request-xsrf-cookie client)
+    (should (jupyter-api-xsrf-header-from-cookies url))))
+
+(ert-deftest jupyter-api-password-authenticator ()
+  :tags '(rest)
+  (let* ((jupyter-test-notebook nil)
+         (url-cookie-storage nil)
+         (port (jupyter-test-ensure-notebook-server
+                ;; foobar
+                "sha1:84cbf6913f79:5df10a65c1f36cdf691bb93b089f7cae0582b20e")))
+    (cl-letf (((symbol-function #'url-cookie-write-file) #'ignore))
+      (unwind-protect
+          (with-current-buffer (process-buffer (car jupyter-test-notebook))
+            (let* ((host (format "localhost:%s" port))
+                   (client (jupyter-rest-client
+                            :url (format "http://%s" host))))
+              (should-not (jupyter-api-server-accessible-p client))
+              (jupyter-api-password-authenticator client (lambda (_) "foobar"))
+              (should (jupyter-api-server-accessible-p client))))
+        (when (process-live-p (car jupyter-test-notebook))
+          (delete-process (car jupyter-test-notebook)))))))
+
+(ert-deftest jupyter-api-token-authenticator ()
+  :tags '(rest)
+  (let* ((jupyter-test-notebook nil)
+         (url-cookie-storage nil)
+         (port (jupyter-test-ensure-notebook-server t)))
+    (cl-letf (((symbol-function #'url-cookie-write-file) #'ignore))
+      (unwind-protect
+          (with-current-buffer (process-buffer (car jupyter-test-notebook))
+            (while (not (re-search-forward "\\?token=\\([a-zA-Z0-9]+\\)" nil t))
+              (goto-char (point-min))
+              (sleep-for 0.02))
+            (let* ((token (match-string 1))
+                   (host (format "localhost:%s" port))
+                   (client (jupyter-rest-client
+                            :url (format "http://%s" host))))
+              (cl-letf (((symbol-function #'read-string)
+                         (lambda (&rest _) token)))
+                (should-not (jupyter-api-server-accessible-p client))
+                (jupyter-api-token-authenticator client)
+                (should (jupyter-api-server-accessible-p client))
+                (should (equal (list (cons "Authorization" (concat "token " token)))
+                               (oref client auth)))
+                (should (equal (list (cons "Authorization" (concat "token " token)))
+                               (jupyter-api-auth-headers client))))))
+        (when (process-live-p (car jupyter-test-notebook))
+          (delete-process (car jupyter-test-notebook)))))))
 
 ;;; Server
 
