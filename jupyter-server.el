@@ -138,9 +138,8 @@ Access should be done through `jupyter-available-kernelspecs'.")))
         (jupyter-api-start-kernel server (car spec))
       (oset kernel id id))))
 
-(cl-defmethod jupyter-kill-kernel ((kernel jupyter-server-kernel))
-  (cl-call-next-method)
-  (slot-makeunbound kernel 'id))
+(cl-defmethod jupyter-kill-kernel ((_kernel jupyter-server-kernel))
+  (error "Forcing shutdown of a kernel on a server not implemented"))
 
 (defclass jupyter-server-kernel-comm (jupyter-comm-layer)
   ((server :type jupyter-server :initarg :server)
