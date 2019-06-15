@@ -60,6 +60,7 @@ start a new kernel REPL instead of re-using one.")
 (make-directory (expand-file-name "tmp" jupyter-test-temporary-directory))
 
 (message "system-configuration %s" system-configuration)
+(message "websocket-version %s" websocket-version)
 
 (add-hook
  'kill-emacs-hook
@@ -544,6 +545,13 @@ see the documentation on the --NotebookApp.password argument."
                 (cons (apply #'start-process
                              "jupyter-notebook" buffer "jupyter" args)
                       port))
-          (sleep-for 2))))))
+          (sleep-for 5))))))
+
+(add-hook 'kill-emacs-hook
+          (lambda ()
+            (ignore-errors
+              (message "%s" (with-current-buffer
+                                (process-buffer (car jupyter-test-notebook))
+                              (buffer-string))))))
 
 ;;; test-helper.el ends here
